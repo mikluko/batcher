@@ -2,6 +2,7 @@ package batcher
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -9,6 +10,7 @@ type Batcher interface {
 	Push(ctx context.Context, v interface{}) error
 	Run(ctx context.Context)
 	Wait(ctx context.Context) error
+	Counters() (items int64, batches int64)
 }
 
 type CallbackFunc func(context.Context, []interface{}) error
@@ -33,9 +35,13 @@ type batcher struct {
 	d time.Duration // batch time limit
 	f CallbackFunc
 
+	t   *time.Timer
 	ch  chan interface{}
 	ech chan error
 	buf []interface{}
+
+	items   int64
+	batches int64
 }
 
 func (b *batcher) Push(ctx context.Context, i interface{}) error {
@@ -43,6 +49,7 @@ func (b *batcher) Push(ctx context.Context, i interface{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case b.ch <- i:
+		atomic.AddInt64(&b.items, 1)
 		return nil
 	}
 }
@@ -57,13 +64,14 @@ func (b *batcher) Wait(ctx context.Context) (err error) {
 	select {
 	case <-ctx.Done():
 		err = ctx.Err()
-		if err == context.DeadlineExceeded {
-			err = nil
-		}
 	case err = <-b.ech:
 		break
 	}
 	return err
+}
+
+func (b *batcher) Counters() (int64, int64) {
+	return atomic.LoadInt64(&b.items), atomic.LoadInt64(&b.batches)
 }
 
 func (b *batcher) loop(ctx context.Context) error {
@@ -77,27 +85,34 @@ func (b *batcher) loop(ctx context.Context) error {
 		if err := b.f(ctx, b.buf); err != nil {
 			return err
 		}
+		atomic.AddInt64(&b.batches, 1)
 		b.buf = b.buf[0:0]
 	}
 }
 
-func (b *batcher) load(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, b.d)
-	defer cancel()
-
+func (b *batcher) load(ctx context.Context) (err error) {
+	if b.t == nil {
+		b.t = time.NewTimer(b.d)
+	} else {
+		b.t.Reset(b.d)
+	}
 	for {
 		select {
+		case <-b.t.C:
+			return nil
 		case <-ctx.Done():
-			err := ctx.Err()
-			if err == context.DeadlineExceeded {
-				err = nil
+			if !b.t.Stop() {
+				<-b.t.C
 			}
-			return err
+			return ctx.Err()
 		case i := <-b.ch:
 			b.buf = append(b.buf, i)
-		}
-		if len(b.buf) == b.n {
-			return nil
+			if len(b.buf) == b.n {
+				if !b.t.Stop() {
+					<-b.t.C
+				}
+				return nil
+			}
 		}
 	}
 }
