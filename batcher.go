@@ -2,6 +2,7 @@ package batcher
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -9,6 +10,7 @@ type Batcher interface {
 	Push(ctx context.Context, v interface{}) error
 	Run(ctx context.Context)
 	Wait(ctx context.Context) error
+	Counters() (items int64, batches int64)
 }
 
 type CallbackFunc func(context.Context, []interface{}) error
@@ -36,6 +38,9 @@ type batcher struct {
 	ch  chan interface{}
 	ech chan error
 	buf []interface{}
+
+	items   int64
+	batches int64
 }
 
 func (b *batcher) Push(ctx context.Context, i interface{}) error {
@@ -43,6 +48,7 @@ func (b *batcher) Push(ctx context.Context, i interface{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case b.ch <- i:
+		atomic.AddInt64(&b.items, 1)
 		return nil
 	}
 }
@@ -66,6 +72,10 @@ func (b *batcher) Wait(ctx context.Context) (err error) {
 	return err
 }
 
+func (b *batcher) Counters() (int64, int64) {
+	return atomic.LoadInt64(&b.items), atomic.LoadInt64(&b.batches)
+}
+
 func (b *batcher) loop(ctx context.Context) error {
 	for {
 		if err := b.load(ctx); err != nil {
@@ -77,6 +87,7 @@ func (b *batcher) loop(ctx context.Context) error {
 		if err := b.f(ctx, b.buf); err != nil {
 			return err
 		}
+		atomic.AddInt64(&b.batches, 1)
 		b.buf = b.buf[0:0]
 	}
 }
