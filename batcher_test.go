@@ -125,3 +125,24 @@ func TestBatcher_Error(t *testing.T) {
 	require.NoError(t, b.Push(ctx, nil))
 	require.Error(t, b.Wait(ctx), e.Error())
 }
+
+func BenchmarkBatcher(b *testing.B) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+
+	d := New(10,
+		time.Millisecond * 100,
+		func(_ context.Context, v []interface{}) error {
+			// time.Sleep(time.Millisecond)
+			return nil
+		},
+	)
+	d.Run(ctx)
+
+	b.RunParallel(func(pb *testing.PB){
+		for pb.Next() {
+			_ = d.Push(ctx, nil)
+		}
+	})
+}
