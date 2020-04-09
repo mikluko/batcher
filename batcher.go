@@ -35,6 +35,7 @@ type batcher struct {
 	d time.Duration // batch time limit
 	f CallbackFunc
 
+	t   *time.Timer
 	ch  chan interface{}
 	ech chan error
 	buf []interface{}
@@ -63,9 +64,6 @@ func (b *batcher) Wait(ctx context.Context) (err error) {
 	select {
 	case <-ctx.Done():
 		err = ctx.Err()
-		if err == context.DeadlineExceeded {
-			err = nil
-		}
 	case err = <-b.ech:
 		break
 	}
@@ -92,23 +90,29 @@ func (b *batcher) loop(ctx context.Context) error {
 	}
 }
 
-func (b *batcher) load(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, b.d)
-	defer cancel()
-
+func (b *batcher) load(ctx context.Context) (err error) {
+	if b.t == nil {
+		b.t = time.NewTimer(b.d)
+	} else {
+		b.t.Reset(b.d)
+	}
 	for {
 		select {
+		case <-b.t.C:
+			return nil
 		case <-ctx.Done():
-			err := ctx.Err()
-			if err == context.DeadlineExceeded {
-				err = nil
+			if !b.t.Stop() {
+				<-b.t.C
 			}
-			return err
+			return ctx.Err()
 		case i := <-b.ch:
 			b.buf = append(b.buf, i)
-		}
-		if len(b.buf) == b.n {
-			return nil
+			if len(b.buf) == b.n {
+				if !b.t.Stop() {
+					<-b.t.C
+				}
+				return nil
+			}
 		}
 	}
 }
