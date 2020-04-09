@@ -9,24 +9,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBatcher(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond * 110)
+func TestBatcher_Full(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var count int
-
 	b := New(2,
-		time.Millisecond*50,
+		time.Second * 50,
 		func(_ context.Context, v []interface{}) error {
-			switch count {
-			case 0:
-				require.Len(t, v, 2)
-			case 1:
-				require.Len(t, v, 1)
-			default:
-				panic("should never happen")
-			}
-			count ++
+			require.Len(t, v, 2)
 			return nil
 		},
 	)
@@ -34,11 +24,88 @@ func TestBatcher(t *testing.T) {
 
 	require.NoError(t, b.Push(ctx, nil))
 	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 10)
+
+	m, n := b.Counters()
+	require.Equal(t, int64(2), m)
+	require.Equal(t, int64(1), n)
+}
+
+func TestBatcher_Partial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b := New(2,
+		time.Millisecond * 50,
+		func(_ context.Context, v []interface{}) error {
+			require.Len(t, v, 1)
+			return nil
+		},
+	)
+	b.Run(ctx)
+
 	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 60)
 
-	require.NoError(t, b.Wait(ctx))
+	m, n := b.Counters()
+	require.Equal(t, int64(1), m)
+	require.Equal(t, int64(1), n)
+}
 
-	require.Equal(t, 2, count)
+func TestBatcher_FullThenPartial(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b := New(2,
+		time.Millisecond * 50,
+		func(_ context.Context, v []interface{}) error {
+			return nil
+		},
+	)
+	b.Run(ctx)
+
+	require.NoError(t, b.Push(ctx, nil))
+	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 5)
+
+	m, n := b.Counters()
+	require.Equal(t, int64(2), m)
+	require.Equal(t, int64(1), n)
+
+	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 60)
+
+	m, n = b.Counters()
+	require.Equal(t, int64(3), m)
+	require.Equal(t, int64(2), n)
+}
+
+func TestBatcher_PartialThenFull(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b := New(2,
+		time.Millisecond * 50,
+		func(_ context.Context, v []interface{}) error {
+			return nil
+		},
+	)
+	b.Run(ctx)
+
+	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 60)
+
+	m, n := b.Counters()
+	require.Equal(t, int64(1), m)
+	require.Equal(t, int64(1), n)
+
+	require.NoError(t, b.Push(ctx, nil))
+	require.NoError(t, b.Push(ctx, nil))
+	time.Sleep(time.Millisecond * 10)
+
+	m, n = b.Counters()
+	require.Equal(t, int64(3), m)
+	require.Equal(t, int64(2), n)
 }
 
 func TestBatcher_Error(t *testing.T) {
