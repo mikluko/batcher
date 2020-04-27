@@ -18,15 +18,19 @@ type Batcher interface {
 type CallbackFunc func(context.Context, []interface{}) error
 
 func New(n int, d time.Duration, f CallbackFunc) Batcher {
-	return newBatcher(n, d, f)
+	return newBatcher(n, 0, d, f)
 }
 
-func newBatcher(n int, d time.Duration, f CallbackFunc) *batcher {
+func NewBuffer(n, l int, d time.Duration, f CallbackFunc) Batcher {
+	return newBatcher(n, l, d, f)
+}
+
+func newBatcher(n, l int, d time.Duration, f CallbackFunc) *batcher {
 	return &batcher{
 		n:   n,
 		d:   d,
 		f:   f,
-		ch:  make(chan interface{}, n),
+		ch:  make(chan interface{}, l),
 		ech: make(chan error),
 		buf: make([]interface{}, 0, n),
 	}
