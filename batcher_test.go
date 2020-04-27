@@ -126,6 +126,30 @@ func TestBatcher_Error(t *testing.T) {
 	require.Error(t, b.Wait(ctx), e.Error())
 }
 
+func TestBatcher_Flush(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	b := New(100,
+		time.Minute,
+		func(_ context.Context, v []interface{}) error {
+			require.Len(t, v, 1)
+			return nil
+		},
+	)
+	b.Run(ctx)
+
+	var err error
+
+	err = b.Push(ctx, nil)
+	require.NoError(t, err)
+
+	time.Sleep(time.Millisecond)
+
+	err = b.Flush(ctx)
+	require.NoError(t, err)
+}
+
 func BenchmarkBatcher(b *testing.B) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
