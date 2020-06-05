@@ -68,6 +68,10 @@ func (b *batcher) Run(ctx context.Context) {
 }
 
 func (b *batcher) Flush(ctx context.Context) error {
+	if len(b.buf) == 0 {
+		return nil
+	}
+
 	b.mux.Lock()
 	defer b.mux.Unlock()
 
