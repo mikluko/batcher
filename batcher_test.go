@@ -127,25 +127,46 @@ func TestBatcher_Error(t *testing.T) {
 }
 
 func TestBatcher_Flush(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	t.Run("one time", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
 
-	b := New(100,
-		time.Minute,
-		func(_ context.Context, v []interface{}) error {
-			require.Len(t, v, 1)
-			return nil
-		},
-	)
-	b.Run(ctx)
+		b := New(100,
+			time.Minute,
+			func(_ context.Context, v []interface{}) error {
+				require.Len(t, v, 1)
+				return nil
+			},
+		)
+		b.Run(ctx)
 
-	var err error
+		var err error
 
-	err = b.Push(ctx, nil)
-	require.NoError(t, err)
+		err = b.Push(ctx, nil)
+		require.NoError(t, err)
 
-	err = b.Flush(ctx)
-	require.NoError(t, err)
+		err = b.Flush(ctx)
+		require.NoError(t, err)
+	})
+
+	t.Run("ignores empty buffer", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		b := New(100,
+			time.Minute,
+			func(_ context.Context, v []interface{}) error {
+				require.Fail(t, "flush should not be called")
+				return nil
+			},
+		)
+		b.Run(ctx)
+
+		var err error
+
+		err = b.Flush(ctx)
+		require.NoError(t, err)
+	})
 }
 
 func TestBatcher_WithBuffer(t *testing.T)  {
