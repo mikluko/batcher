@@ -9,8 +9,7 @@ import (
 
 type Batcher interface {
 	Push(ctx context.Context, v interface{}) error
-	Run(ctx context.Context)
-	Wait(ctx context.Context) error
+	Run(ctx context.Context) error
 	Flush(ctx context.Context) error
 	Counters() (items int64, batches int64)
 }
@@ -31,7 +30,6 @@ func newBatcher(n, l int, d time.Duration, f CallbackFunc) *batcher {
 		d:   d,
 		f:   f,
 		ch:  make(chan interface{}, l),
-		ech: make(chan error),
 		buf: make([]interface{}, 0, n),
 	}
 }
@@ -43,7 +41,6 @@ type batcher struct {
 
 	t   *time.Timer
 	ch  chan interface{}
-	ech chan error
 	buf []interface{}
 	mux sync.Mutex
 
@@ -61,10 +58,8 @@ func (b *batcher) Push(ctx context.Context, i interface{}) error {
 	}
 }
 
-func (b *batcher) Run(ctx context.Context) {
-	go func() {
-		b.ech <- b.loop(ctx)
-	}()
+func (b *batcher) Run(ctx context.Context) error {
+	return b.loop(ctx)
 }
 
 func (b *batcher) Flush(ctx context.Context) error {
@@ -80,16 +75,6 @@ func (b *batcher) Flush(ctx context.Context) error {
 	}
 	b.buf = b.buf[0:0]
 	return nil
-}
-
-func (b *batcher) Wait(ctx context.Context) (err error) {
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-	case err = <-b.ech:
-		break
-	}
-	return err
 }
 
 func (b *batcher) Counters() (int64, int64) {

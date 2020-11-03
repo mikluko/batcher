@@ -20,7 +20,9 @@ func TestBatcher_Full(t *testing.T) {
 			return nil
 		},
 	)
-	b.Run(ctx)
+	go func() {
+		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+	}()
 
 	require.NoError(t, b.Push(ctx, nil))
 	require.NoError(t, b.Push(ctx, nil))
@@ -42,7 +44,10 @@ func TestBatcher_Partial(t *testing.T) {
 			return nil
 		},
 	)
-	b.Run(ctx)
+
+	go func() {
+		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+	}()
 
 	require.NoError(t, b.Push(ctx, nil))
 	time.Sleep(time.Millisecond * 60)
@@ -62,7 +67,10 @@ func TestBatcher_FullThenPartial(t *testing.T) {
 			return nil
 		},
 	)
-	b.Run(ctx)
+
+	go func() {
+		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+	}()
 
 	require.NoError(t, b.Push(ctx, nil))
 	require.NoError(t, b.Push(ctx, nil))
@@ -90,7 +98,10 @@ func TestBatcher_PartialThenFull(t *testing.T) {
 			return nil
 		},
 	)
-	b.Run(ctx)
+
+	go func() {
+		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+	}()
 
 	require.NoError(t, b.Push(ctx, nil))
 	time.Sleep(time.Millisecond * 60)
@@ -120,10 +131,13 @@ func TestBatcher_Error(t *testing.T) {
 			return e
 		},
 	)
-	b.Run(ctx)
+
+	go func() {
+		require.True(t, errors.Is(b.Run(ctx), e))
+	}()
+
 
 	require.NoError(t, b.Push(ctx, nil))
-	require.Error(t, b.Wait(ctx), e.Error())
 }
 
 func TestBatcher_Flush(t *testing.T) {
@@ -138,7 +152,9 @@ func TestBatcher_Flush(t *testing.T) {
 				return nil
 			},
 		)
-		b.Run(ctx)
+		go func() {
+			require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+		}()
 
 		var err error
 
@@ -160,7 +176,9 @@ func TestBatcher_Flush(t *testing.T) {
 				return nil
 			},
 		)
-		b.Run(ctx)
+		go func() {
+			require.True(t, errors.Is(b.Run(ctx), context.Canceled))
+		}()
 
 		var err error
 
@@ -170,7 +188,7 @@ func TestBatcher_Flush(t *testing.T) {
 }
 
 func TestBatcher_WithBuffer(t *testing.T)  {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
 	defer cancel()
 
 	b := NewBuffer(1, 2, time.Minute, func(ctx context.Context, i []interface{}) error {
@@ -185,6 +203,9 @@ func TestBatcher_WithBuffer(t *testing.T)  {
 
 	err = b.Push(ctx, nil)
 	require.NoError(t, err)
+
+	err = b.Push(ctx, nil)
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
 }
 
 func BenchmarkBatcher(b *testing.B) {
@@ -198,7 +219,10 @@ func BenchmarkBatcher(b *testing.B) {
 			return nil
 		},
 	)
-	d.Run(ctx)
+
+	go func() {
+		require.True(b, errors.Is(d.Run(ctx), context.Canceled))
+	}()
 
 	b.RunParallel(func(pb *testing.PB){
 		for pb.Next() {
