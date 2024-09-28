@@ -1,4 +1,4 @@
-module github.com/akabos/batcher
+module github.com/mikluko/batcher
 
 go 1.14
 
