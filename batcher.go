@@ -31,6 +31,44 @@ func (f CallbackFunc[T]) Call(ctx context.Context, batch []T) error {
 	return f(ctx, batch)
 }
 
+// FlushReason says why a batch flushed.
+type FlushReason string
+
+// The flush reasons. A batch that fills to the size limit flushes for
+// FlushReasonSize even while Close is draining; FlushReasonDrain marks only
+// the final flush of what remained when intake ended.
+const (
+	FlushReasonSize     FlushReason = "size"     // the batch reached its size limit
+	FlushReasonInterval FlushReason = "interval" // the oldest item waited out the interval
+	FlushReasonDrain    FlushReason = "drain"    // Close delivered the remainder
+)
+
+// Observer receives measurement events from a Batcher, registered with
+// WithObserver. The batcher calls ObservePush for each accepted Push,
+// ObserveFlush once per delivered batch, ObserveError for each non-nil
+// callback error, and ObserveDrop with the number of accepted items
+// abandoned when the context given to Close expires. ObservePush may be
+// called concurrently with the other methods; implementations must be safe
+// for concurrent use.
+type Observer interface {
+	// ObservePush is called once per accepted Push.
+	ObservePush()
+
+	// ObserveFlush is called once per delivered batch with the reason the
+	// batch flushed, its size, and the duration of the whole sequential
+	// callback fan-out as measured by the batcher.
+	ObserveFlush(reason FlushReason, size int, d time.Duration)
+
+	// ObserveError is called with each non-nil callback error, in addition
+	// to, not instead of, the error handler. It runs before the handler.
+	ObserveError(err error)
+
+	// ObserveDrop is called with the number of accepted items left
+	// undelivered when the context given to Close expires. It is not called
+	// when nothing was abandoned.
+	ObserveDrop(n int)
+}
+
 // Option configures a Batcher at construction.
 type Option[T any] func(*Batcher[T])
 
@@ -48,6 +86,15 @@ func WithCallback[T any](cb Callback[T]) Option[T] {
 func WithBuffer[T any](l int) Option[T] {
 	return func(b *Batcher[T]) {
 		b.buffer = l
+	}
+}
+
+// WithObserver registers an observer. It is repeatable: every event reaches
+// all registered observers, in registration order. With no observers
+// registered, observation costs nothing.
+func WithObserver[T any](o Observer) Option[T] {
+	return func(b *Batcher[T]) {
+		b.observers = append(b.observers, o)
 	}
 }
 
@@ -69,6 +116,7 @@ type Batcher[T any] struct {
 	d         time.Duration
 	buffer    int
 	callbacks []Callback[T]
+	observers []Observer
 	errh      func(context.Context, error)
 
 	ch     chan T
@@ -123,6 +171,9 @@ func (b *Batcher[T]) Push(ctx context.Context, v T) error {
 
 	select {
 	case b.ch <- v:
+		for _, o := range b.observers {
+			o.ObservePush()
+		}
 		return nil
 	case <-b.ctx.Done():
 		return ErrClosed
@@ -167,7 +218,7 @@ func (b *Batcher[T]) loop() {
 		timerC <-chan time.Time
 	)
 
-	flush := func() {
+	flush := func(reason FlushReason) {
 		if timer != nil {
 			timer.Stop()
 			timerC = nil
@@ -175,9 +226,22 @@ func (b *Batcher[T]) loop() {
 		if len(buf) == 0 {
 			return
 		}
+		var start time.Time
+		if len(b.observers) != 0 {
+			start = time.Now()
+		}
 		for _, cb := range b.callbacks {
 			if err := cb.Call(b.ctx, buf); err != nil {
+				for _, o := range b.observers {
+					o.ObserveError(err)
+				}
 				b.errh(b.ctx, err)
+			}
+		}
+		if len(b.observers) != 0 {
+			d := time.Since(start)
+			for _, o := range b.observers {
+				o.ObserveFlush(reason, len(buf), d)
 			}
 		}
 		buf = buf[:0]
@@ -186,21 +250,23 @@ func (b *Batcher[T]) loop() {
 	for {
 		select {
 		case <-b.ctx.Done():
+			b.abandon(len(buf))
 			return
 		default:
 		}
 		select {
 		case <-b.ctx.Done():
+			b.abandon(len(buf))
 			return
 		case v, ok := <-b.ch:
 			if !ok {
-				flush()
+				flush(FlushReasonDrain)
 				return
 			}
 			buf = append(buf, v)
 			switch {
 			case len(buf) >= b.n:
-				flush()
+				flush(FlushReasonSize)
 			case len(buf) == 1:
 				if timer == nil {
 					timer = time.NewTimer(b.d)
@@ -211,7 +277,27 @@ func (b *Batcher[T]) loop() {
 			}
 		case <-timerC:
 			timerC = nil
-			flush()
+			flush(FlushReasonInterval)
 		}
+	}
+}
+
+// abandon reports to the observers the accepted items the loop leaves
+// undelivered on context expiry: the pending batch plus everything still in
+// the intake channel, which it drains to count. It blocks until Push can no
+// longer accept, so the count is final.
+func (b *Batcher[T]) abandon(pending int) {
+	if len(b.observers) == 0 {
+		return
+	}
+	n := pending
+	for range b.ch {
+		n++
+	}
+	if n == 0 {
+		return
+	}
+	for _, o := range b.observers {
+		o.ObserveDrop(n)
 	}
 }

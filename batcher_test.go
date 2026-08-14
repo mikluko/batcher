@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -334,6 +335,280 @@ func TestCallbackFunc(t *testing.T) {
 	if !slices.Equal(got, []int{1, 2}) {
 		t.Fatalf("batch passed through: got %v, want [1 2]", got)
 	}
+}
+
+// flushEvent is one ObserveFlush call as recorded by observerRecorder.
+type flushEvent struct {
+	reason FlushReason
+	size   int
+	d      time.Duration
+}
+
+// observerRecorder records every observer event. It is safe for concurrent
+// use because ObservePush arrives from pushing goroutines while the rest
+// arrive from the delivery loop.
+type observerRecorder struct {
+	mu      sync.Mutex
+	pushes  int
+	flushes []flushEvent
+	errs    []error
+	drops   []int
+}
+
+func (o *observerRecorder) ObservePush() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.pushes++
+}
+
+func (o *observerRecorder) ObserveFlush(reason FlushReason, size int, d time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.flushes = append(o.flushes, flushEvent{reason, size, d})
+}
+
+func (o *observerRecorder) ObserveError(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.errs = append(o.errs, err)
+}
+
+func (o *observerRecorder) ObserveDrop(n int) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.drops = append(o.drops, n)
+}
+
+func (o *observerRecorder) snapshot() observerRecorder {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return observerRecorder{
+		pushes:  o.pushes,
+		flushes: slices.Clone(o.flushes),
+		errs:    slices.Clone(o.errs),
+		drops:   slices.Clone(o.drops),
+	}
+}
+
+func assertFlushes(t *testing.T, got, want []flushEvent) {
+	t.Helper()
+	if !slices.Equal(got, want) {
+		t.Fatalf("flush events: got %v, want %v", got, want)
+	}
+}
+
+func TestObserverSizeFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		var o observerRecorder
+		b := New(2, time.Hour, WithCallback[int](&r), WithObserver[int](&o))
+		mustPush(t, b, 1)
+		mustPush(t, b, 2)
+		synctest.Wait()
+		got := o.snapshot()
+		if got.pushes != 2 {
+			t.Fatalf("pushes observed: got %d, want 2", got.pushes)
+		}
+		assertFlushes(t, got.flushes, []flushEvent{{FlushReasonSize, 2, 0}})
+		mustClose(t, b)
+	})
+}
+
+func TestObserverIntervalFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const d = 5 * time.Second
+		var r recorder
+		var o observerRecorder
+		b := New(3, d, WithCallback[int](&r), WithObserver[int](&o))
+		mustPush(t, b, 1)
+		time.Sleep(d)
+		synctest.Wait()
+		assertFlushes(t, o.snapshot().flushes, []flushEvent{{FlushReasonInterval, 1, 0}})
+		mustClose(t, b)
+	})
+}
+
+func TestObserverDrainFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		var o observerRecorder
+		b := New(10, time.Hour, WithCallback[int](&r), WithObserver[int](&o))
+		mustPush(t, b, 1)
+		mustPush(t, b, 2)
+		mustPush(t, b, 3)
+		mustClose(t, b)
+		assertFlushes(t, o.snapshot().flushes, []flushEvent{{FlushReasonDrain, 3, 0}})
+	})
+}
+
+func TestObserverSizeFlushesDuringDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		var o observerRecorder
+		b := New(2, time.Hour, WithBuffer[int](8), WithCallback[int](&r), WithObserver[int](&o))
+		for i := 1; i <= 5; i++ {
+			mustPush(t, b, i)
+		}
+		mustClose(t, b)
+		assertFlushes(t, o.snapshot().flushes, []flushEvent{
+			{FlushReasonSize, 2, 0},
+			{FlushReasonSize, 2, 0},
+			{FlushReasonDrain, 1, 0},
+		})
+	})
+}
+
+func TestObserverFlushDurationCoversFanOut(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const each = 2 * time.Second
+		slow := CallbackFunc[int](func(context.Context, []int) error {
+			time.Sleep(each)
+			return nil
+		})
+		var o observerRecorder
+		b := New(1, time.Hour,
+			WithCallback[int](slow),
+			WithCallback[int](slow),
+			WithObserver[int](&o))
+		mustPush(t, b, 1)
+		mustClose(t, b)
+		assertFlushes(t, o.snapshot().flushes, []flushEvent{{FlushReasonSize, 1, 2 * each}})
+	})
+}
+
+func TestObserverError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		var handled []error
+		var o observerRecorder
+		b := New(1, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(context.Context, []int) error {
+				return boom
+			})),
+			WithCallback[int](CallbackFunc[int](func(context.Context, []int) error {
+				return nil
+			})),
+			WithErrorHandler[int](func(_ context.Context, err error) {
+				handled = append(handled, err)
+			}),
+			WithObserver[int](&o))
+		mustPush(t, b, 1)
+		mustClose(t, b)
+		got := o.snapshot()
+		if len(got.errs) != 1 || !errors.Is(got.errs[0], boom) {
+			t.Fatalf("errors observed: got %v, want [boom]", got.errs)
+		}
+		if len(handled) != 1 || !errors.Is(handled[0], boom) {
+			t.Fatalf("error handler still runs: got %v, want [boom]", handled)
+		}
+		assertFlushes(t, got.flushes, []flushEvent{{FlushReasonSize, 1, 0}})
+	})
+}
+
+func TestObserverDropOnCloseExpiry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var o observerRecorder
+		b := New(1, time.Hour,
+			WithBuffer[int](1),
+			WithCallback[int](CallbackFunc[int](func(cbCtx context.Context, _ []int) error {
+				<-cbCtx.Done()
+				return nil
+			})),
+			WithObserver[int](&o))
+		mustPush(t, b, 1)
+		synctest.Wait()
+		mustPush(t, b, 2)
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := b.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close with expired ctx: got %v, want DeadlineExceeded", err)
+		}
+		synctest.Wait()
+		got := o.snapshot()
+		if got.pushes != 2 {
+			t.Fatalf("pushes observed: got %d, want 2", got.pushes)
+		}
+		if !slices.Equal(got.drops, []int{1}) {
+			t.Fatalf("drops observed: got %v, want [1]", got.drops)
+		}
+		assertFlushes(t, got.flushes, []flushEvent{{FlushReasonSize, 1, time.Second}})
+	})
+}
+
+func TestObserverNoDropOnCleanClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		var o observerRecorder
+		b := New(10, time.Hour, WithCallback[int](&r), WithObserver[int](&o))
+		mustPush(t, b, 1)
+		mustClose(t, b)
+		if got := o.snapshot().drops; len(got) != 0 {
+			t.Fatalf("drops observed on clean close: got %v, want none", got)
+		}
+	})
+}
+
+// eventLog is a mutex-guarded shared log the tagging observers append to.
+// Push events arrive from the pushing goroutine and the rest from the
+// delivery loop, so their relative order across categories is scheduling;
+// within one category the batcher promises registration order.
+type eventLog struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *eventLog) add(entry string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, entry)
+}
+
+func (l *eventLog) withSuffix(suffix string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, e := range l.entries {
+		if strings.HasSuffix(e, suffix) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// taggingObserver tags every event it receives into a shared eventLog.
+type taggingObserver struct {
+	tag string
+	log *eventLog
+}
+
+func (o taggingObserver) ObservePush()                                 { o.log.add(o.tag + ":push") }
+func (o taggingObserver) ObserveFlush(FlushReason, int, time.Duration) { o.log.add(o.tag + ":flush") }
+func (o taggingObserver) ObserveError(error)                           { o.log.add(o.tag + ":error") }
+func (o taggingObserver) ObserveDrop(int)                              { o.log.add(o.tag + ":drop") }
+
+func TestObserversAllReceiveEventsInRegistrationOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		var log eventLog
+		b := New(1, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(context.Context, []int) error {
+				return boom
+			})),
+			WithErrorHandler[int](func(context.Context, error) {}),
+			WithObserver[int](taggingObserver{"a", &log}),
+			WithObserver[int](taggingObserver{"b", &log}))
+		mustPush(t, b, 1)
+		mustClose(t, b)
+		for suffix, want := range map[string][]string{
+			":push":  {"a:push", "b:push"},
+			":error": {"a:error", "b:error"},
+			":flush": {"a:flush", "b:flush"},
+		} {
+			if got := log.withSuffix(suffix); !slices.Equal(got, want) {
+				t.Fatalf("%s events: got %v, want %v", suffix, got, want)
+			}
+		}
+	})
 }
 
 func BenchmarkBatcher(b *testing.B) {
