@@ -3,6 +3,7 @@ package batcher
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,113 +11,100 @@ import (
 )
 
 func TestBatcher_Full(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	b := New(2,
-		time.Second*50,
+	var items, batches atomic.Int64
+	b := New(2, 50*time.Second, WithCallback(CallbackFunc[struct{}](
 		func(_ context.Context, v []struct{}) error {
 			require.Len(t, v, 2)
+			items.Add(int64(len(v)))
+			batches.Add(1)
 			return nil
 		},
-	)
-	go func() {
-		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-	}()
+	)))
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 10)
+	time.Sleep(10 * time.Millisecond)
 
-	m, n := b.Counters()
-	require.Equal(t, int64(2), m)
-	require.Equal(t, int64(1), n)
+	require.Equal(t, int64(2), items.Load())
+	require.Equal(t, int64(1), batches.Load())
 }
 
 func TestBatcher_Partial(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	b := New(2,
-		time.Millisecond*50,
+	var items, batches atomic.Int64
+	b := New(2, 50*time.Millisecond, WithCallback(CallbackFunc[struct{}](
 		func(_ context.Context, v []struct{}) error {
 			require.Len(t, v, 1)
+			items.Add(int64(len(v)))
+			batches.Add(1)
 			return nil
 		},
-	)
-
-	go func() {
-		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-	}()
+	)))
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 60)
+	time.Sleep(60 * time.Millisecond)
 
-	m, n := b.Counters()
-	require.Equal(t, int64(1), m)
-	require.Equal(t, int64(1), n)
+	require.Equal(t, int64(1), items.Load())
+	require.Equal(t, int64(1), batches.Load())
 }
 
 func TestBatcher_FullThenPartial(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	b := New(2,
-		time.Millisecond*50,
+	var items, batches atomic.Int64
+	b := New(2, 50*time.Millisecond, WithCallback(CallbackFunc[struct{}](
 		func(_ context.Context, v []struct{}) error {
+			items.Add(int64(len(v)))
+			batches.Add(1)
 			return nil
 		},
-	)
-
-	go func() {
-		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-	}()
+	)))
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 5)
+	time.Sleep(5 * time.Millisecond)
 
-	m, n := b.Counters()
-	require.Equal(t, int64(2), m)
-	require.Equal(t, int64(1), n)
+	require.Equal(t, int64(2), items.Load())
+	require.Equal(t, int64(1), batches.Load())
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 60)
+	time.Sleep(60 * time.Millisecond)
 
-	m, n = b.Counters()
-	require.Equal(t, int64(3), m)
-	require.Equal(t, int64(2), n)
+	require.Equal(t, int64(3), items.Load())
+	require.Equal(t, int64(2), batches.Load())
 }
 
 func TestBatcher_PartialThenFull(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	b := New(2,
-		time.Millisecond*50,
+	var items, batches atomic.Int64
+	b := New(2, 50*time.Millisecond, WithCallback(CallbackFunc[struct{}](
 		func(_ context.Context, v []struct{}) error {
+			items.Add(int64(len(v)))
+			batches.Add(1)
 			return nil
 		},
-	)
-
-	go func() {
-		require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-	}()
+	)))
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 60)
+	time.Sleep(60 * time.Millisecond)
 
-	m, n := b.Counters()
-	require.Equal(t, int64(1), m)
-	require.Equal(t, int64(1), n)
+	require.Equal(t, int64(1), items.Load())
+	require.Equal(t, int64(1), batches.Load())
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
 	require.NoError(t, b.Push(ctx, struct{}{}))
-	time.Sleep(time.Millisecond * 10)
+	time.Sleep(10 * time.Millisecond)
 
-	m, n = b.Counters()
-	require.Equal(t, int64(3), m)
-	require.Equal(t, int64(2), n)
+	require.Equal(t, int64(3), items.Load())
+	require.Equal(t, int64(2), batches.Load())
 }
 
 func TestBatcher_Error(t *testing.T) {
@@ -124,65 +112,69 @@ func TestBatcher_Error(t *testing.T) {
 	defer cancel()
 
 	e := errors.New("some error")
+	got := make(chan error, 1)
 
-	b := New(1,
-		time.Millisecond*100,
-		func(_ context.Context, v []struct{}) error {
-			return e
-		},
+	b := New(1, 100*time.Millisecond,
+		WithCallback(CallbackFunc[struct{}](
+			func(context.Context, []struct{}) error { return e },
+		)),
+		WithErrorHandler[struct{}](func(_ context.Context, err error) { got <- err }),
 	)
-
-	go func() {
-		require.True(t, errors.Is(b.Run(ctx), e))
-	}()
+	t.Cleanup(func() { _ = b.Close(context.Background()) })
 
 	require.NoError(t, b.Push(ctx, struct{}{}))
+
+	select {
+	case err := <-got:
+		require.ErrorIs(t, err, e)
+	case <-ctx.Done():
+		t.Fatal("error was not delivered to the handler")
+	}
 }
 
-func TestBatcher_Flush(t *testing.T) {
-	t.Run("one time", func(t *testing.T) {
+func TestBatcher_Close(t *testing.T) {
+	t.Run("drains pending batch", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		b := New(100,
-			time.Minute,
+		var batches atomic.Int64
+		b := New(100, time.Minute, WithCallback(CallbackFunc[struct{}](
 			func(_ context.Context, v []struct{}) error {
 				require.Len(t, v, 1)
+				batches.Add(1)
 				return nil
 			},
-		)
-		go func() {
-			require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-		}()
+		)))
 
-		var err error
-
-		err = b.Push(ctx, struct{}{})
-		require.NoError(t, err)
-
-		err = b.Flush(ctx)
-		require.NoError(t, err)
+		require.NoError(t, b.Push(ctx, struct{}{}))
+		require.NoError(t, b.Close(ctx))
+		require.Equal(t, int64(1), batches.Load())
 	})
 
 	t.Run("ignores empty buffer", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		b := New(100,
-			time.Minute,
-			func(_ context.Context, v []struct{}) error {
-				require.Fail(t, "flush should not be called")
+		b := New(100, time.Minute, WithCallback(CallbackFunc[struct{}](
+			func(context.Context, []struct{}) error {
+				require.Fail(t, "callback should not be called")
 				return nil
 			},
-		)
-		go func() {
-			require.True(t, errors.Is(b.Run(ctx), context.Canceled))
-		}()
+		)))
 
-		var err error
+		require.NoError(t, b.Close(ctx))
+	})
 
-		err = b.Flush(ctx)
-		require.NoError(t, err)
+	t.Run("push after close", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		b := New(100, time.Minute, WithCallback(CallbackFunc[struct{}](
+			func(context.Context, []struct{}) error { return nil },
+		)))
+
+		require.NoError(t, b.Close(ctx))
+		require.ErrorIs(t, b.Push(ctx, struct{}{}), ErrClosed)
 	})
 }
 
@@ -190,37 +182,45 @@ func TestBatcher_WithBuffer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	b := NewBuffer(1, 2, time.Minute, func(ctx context.Context, i []struct{}) error {
-		<-ctx.Done()
-		return nil
+	entered := make(chan struct{})
+	unblock := make(chan struct{})
+	first := true
+
+	b := New(1, time.Minute,
+		WithBuffer[struct{}](2),
+		WithCallback(CallbackFunc[struct{}](
+			func(context.Context, []struct{}) error {
+				if first {
+					first = false
+					close(entered)
+					<-unblock
+				}
+				return nil
+			},
+		)),
+	)
+	t.Cleanup(func() {
+		close(unblock)
+		_ = b.Close(context.Background())
 	})
 
-	var err error
+	require.NoError(t, b.Push(ctx, struct{}{}))
+	<-entered
 
-	err = b.Push(ctx, struct{}{})
-	require.NoError(t, err)
+	require.NoError(t, b.Push(ctx, struct{}{}))
+	require.NoError(t, b.Push(ctx, struct{}{}))
 
-	err = b.Push(ctx, struct{}{})
-	require.NoError(t, err)
-
-	err = b.Push(ctx, struct{}{})
-	require.True(t, errors.Is(err, context.DeadlineExceeded))
+	err := b.Push(ctx, struct{}{})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func BenchmarkBatcher(b *testing.B) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 
-	d := New(10,
-		time.Millisecond*100,
-		func(_ context.Context, v []struct{}) error {
-			return nil
-		},
-	)
-
-	go func() {
-		require.True(b, errors.Is(d.Run(ctx), context.Canceled))
-	}()
+	d := New(10, 100*time.Millisecond, WithCallback(CallbackFunc[struct{}](
+		func(context.Context, []struct{}) error { return nil },
+	)))
+	defer func() { _ = d.Close(ctx) }()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
