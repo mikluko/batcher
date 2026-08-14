@@ -43,3 +43,7 @@ if err := b.Close(ctx); err != nil {
 - **Shutdown.** `Close` stops intake (`Push` returns `ErrClosed`) and drains everything already accepted through the callbacks as final batches. Only expiry of the context passed to `Close` abandons the remainder, returning its error; shutdown loss is always the caller's explicit deadline. `Close` is idempotent.
 
 Full documentation and runnable examples: [pkg.go.dev/github.com/mikluko/batcher](https://pkg.go.dev/github.com/mikluko/batcher).
+
+## License
+
+[MIT](LICENSE)
