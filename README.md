@@ -1,6 +1,7 @@
 # batcher
 
 [![CI](https://github.com/mikluko/batcher/actions/workflows/ci.yml/badge.svg)](https://github.com/mikluko/batcher/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mikluko/batcher.svg)](https://pkg.go.dev/github.com/mikluko/batcher)
 
 Generic batching for Go: accumulate pushed items and deliver them to callbacks when a batch fills up or its oldest item has waited long enough.
 
