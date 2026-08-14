@@ -1,6 +1,10 @@
 // Package batcher accumulates pushed items into batches and delivers them to
 // registered callbacks when a batch reaches its size limit or its oldest item
-// has waited out the interval.
+// has waited out the interval. Nothing runs while a batcher is idle.
+//
+// Delivery is loud by default: a callback error panics unless WithErrorHandler
+// installs a handler. Close stops intake and drains everything already
+// accepted; only expiry of its context abandons items.
 package batcher
 
 import (
@@ -48,7 +52,8 @@ func WithBuffer[T any](l int) Option[T] {
 }
 
 // WithErrorHandler sets the handler invoked with each non-nil callback error.
-// The default handler panics.
+// Without it the batcher is loud by default: the default handler panics on the
+// first error. Tolerating callback errors is opt-in through this option.
 func WithErrorHandler[T any](h func(context.Context, error)) Option[T] {
 	return func(b *Batcher[T]) {
 		b.errh = h
@@ -80,7 +85,8 @@ type Batcher[T any] struct {
 }
 
 // New returns a running Batcher that flushes a batch when it reaches n items
-// or when its oldest item has waited d. At least one WithCallback option is
+// or when its oldest item has waited d. The delivery loop runs in a goroutine
+// New starts; stop it with Close. At least one WithCallback option is
 // required; New panics otherwise.
 func New[T any](n int, d time.Duration, opts ...Option[T]) *Batcher[T] {
 	b := &Batcher[T]{n: n, d: d}
