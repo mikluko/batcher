@@ -11,7 +11,7 @@ Generic batching for Go: accumulate pushed items and deliver them to callbacks w
 go get github.com/mikluko/batcher
 ```
 
-Requires Go 1.26 or newer. The core package imports nothing beyond the standard library; the `prom` package carries `prometheus/client_golang`, and only importers of it compile the dependency.
+Requires Go 1.26 or newer. The module depends on nothing beyond the standard library: `go.mod` carries no `require` directive, so nothing reaches your module graph, your `go.sum`, or your build. CI fails if that stops being true.
 
 ## Usage
 
@@ -45,19 +45,18 @@ if err := b.Close(ctx); err != nil {
 
 Full documentation and runnable examples: [pkg.go.dev/github.com/mikluko/batcher](https://pkg.go.dev/github.com/mikluko/batcher).
 
-## Metrics
+## Instrumentation
 
-`github.com/mikluko/batcher/prom` exposes a batcher's activity as Prometheus metrics. Two options wire it up; both are generic over the item type and spell the type argument explicitly:
+`WithObserver` takes an `Observer` and calls it on every accepted push, delivered batch, callback error, and item abandoned at shutdown. It is the whole instrumentation seam: with no observer registered, observation costs nothing.
 
 ```go
 b := batcher.New(100, time.Second,
     batcher.WithCallback(cb),
-    prom.WithRegisterer[Item](reg),      // register on a caller-supplied prometheus.Registerer
-    // prom.WithDefaultRegisterer[Item]() // or on prometheus.DefaultRegisterer
+    batcher.WithObserver[Item](obs),
 )
 ```
 
-Registration uses `MustRegister` semantics: registering the same metrics twice on one registerer panics.
+Wiring an `Observer` to a metrics backend is the caller's, since the backend is the caller's. [`examples/prom`](examples/prom) is a worked Prometheus one: six collectors, registered on a `prometheus.Registerer`, served over `/metrics`. It is its own module, so its dependencies stay out of yours. Copy it and adjust the names, buckets, and labels to the tree it lands in.
 
 | Metric | Type | Meaning |
 |---|---|---|
@@ -67,14 +66,6 @@ Registration uses `MustRegister` semantics: registering the same metrics twice o
 | `batcher_flush_duration_seconds` | histogram | Duration of the callback fan-out per batch |
 | `batcher_callback_errors_total` | counter | Non-nil callback errors |
 | `batcher_items_dropped_total` | counter | Accepted items abandoned when the `Close` context expired |
-
-The metrics carry no instance label. To tell several batchers in one process apart, wrap the registerer per instance:
-
-```go
-prom.WithRegisterer[Item](prometheus.WrapRegistererWith(
-    prometheus.Labels{"batcher": "audit-log"}, reg,
-))
-```
 
 ## License
 

@@ -12,5 +12,21 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # go list -m all prints the main module first; anything after it is a
+      # dependency the module is not allowed to have.
+      - name: Module depends on nothing but the standard library
+        run: test -z "$(go list -m all | tail -n +2)"
       - run: go vet ./...
       - run: go test -race ./...
+
+  example:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+        working-directory: examples/prom
+      - run: go test -race ./...
+        working-directory: examples/prom
