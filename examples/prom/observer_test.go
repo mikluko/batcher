@@ -1,4 +1,4 @@
-package prom_test
+package main
 
 import (
 	"context"
@@ -7,12 +7,20 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/mikluko/batcher"
-	"github.com/mikluko/batcher/prom"
 )
+
+// newRegisteredObserver builds the metric set, registers it on a fresh
+// registry, and returns both plus the batcher option installing it.
+func newRegisteredObserver[T any](t *testing.T) (*prometheus.Registry, batcher.Option[T]) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	obs := newObserver()
+	obs.register(reg)
+	return reg, batcher.WithObserver[T](obs)
+}
 
 func counterValue(t *testing.T, reg *prometheus.Registry, name string, labels map[string]string) float64 {
 	t.Helper()
@@ -71,13 +79,13 @@ func checkCounter(t *testing.T, reg *prometheus.Registry, name string, labels ma
 	}
 }
 
-func TestWithRegisterer(t *testing.T) {
-	reg := prometheus.NewRegistry()
+func TestObserverCounts(t *testing.T) {
+	reg, opt := newRegisteredObserver[int](t)
 	b := batcher.New(2, time.Hour,
 		batcher.WithCallback(batcher.CallbackFunc[int](func(context.Context, []int) error {
 			return nil
 		})),
-		prom.WithRegisterer[int](reg),
+		opt,
 	)
 
 	ctx := context.Background()
@@ -114,15 +122,15 @@ func TestWithRegisterer(t *testing.T) {
 	}
 }
 
-func TestWithRegistererIntervalReason(t *testing.T) {
-	reg := prometheus.NewRegistry()
+func TestObserverIntervalReason(t *testing.T) {
+	reg, opt := newRegisteredObserver[int](t)
 	flushed := make(chan struct{}, 1)
 	b := batcher.New(10, 10*time.Millisecond,
 		batcher.WithCallback(batcher.CallbackFunc[int](func(context.Context, []int) error {
 			flushed <- struct{}{}
 			return nil
 		})),
-		prom.WithRegisterer[int](reg),
+		opt,
 	)
 
 	ctx := context.Background()
@@ -137,14 +145,14 @@ func TestWithRegistererIntervalReason(t *testing.T) {
 	checkCounter(t, reg, "batcher_batches_total", map[string]string{"reason": "interval"}, 1)
 }
 
-func TestWithRegistererCallbackErrors(t *testing.T) {
-	reg := prometheus.NewRegistry()
+func TestObserverCallbackErrors(t *testing.T) {
+	reg, opt := newRegisteredObserver[int](t)
 	b := batcher.New(1, time.Hour,
 		batcher.WithCallback(batcher.CallbackFunc[int](func(context.Context, []int) error {
 			return errors.New("boom")
 		})),
 		batcher.WithErrorHandler[int](func(context.Context, error) {}),
-		prom.WithRegisterer[int](reg),
+		opt,
 	)
 
 	ctx := context.Background()
@@ -161,8 +169,8 @@ func TestWithRegistererCallbackErrors(t *testing.T) {
 	checkCounter(t, reg, "batcher_callback_errors_total", nil, 2)
 }
 
-func TestWithRegistererDroppedItems(t *testing.T) {
-	reg := prometheus.NewRegistry()
+func TestObserverDroppedItems(t *testing.T) {
+	reg, opt := newRegisteredObserver[int](t)
 	started := make(chan struct{})
 	b := batcher.New(1, time.Hour,
 		batcher.WithCallback(batcher.CallbackFunc[int](func(ctx context.Context, _ []int) error {
@@ -172,7 +180,7 @@ func TestWithRegistererDroppedItems(t *testing.T) {
 		})),
 		batcher.WithErrorHandler[int](func(context.Context, error) {}),
 		batcher.WithBuffer[int](8),
-		prom.WithRegisterer[int](reg),
+		opt,
 	)
 
 	ctx := context.Background()
@@ -198,46 +206,4 @@ func TestWithRegistererDroppedItems(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-}
-
-func TestWithRegistererDoubleRegistrationPanics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	_ = prom.WithRegisterer[int](reg)
-	defer func() {
-		if recover() == nil {
-			t.Fatal("second WithRegisterer on the same registry did not panic")
-		}
-	}()
-	prom.WithRegisterer[int](reg)
-}
-
-func TestWithDefaultRegisterer(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	orig := prometheus.DefaultRegisterer
-	prometheus.DefaultRegisterer = reg
-	t.Cleanup(func() { prometheus.DefaultRegisterer = orig })
-
-	b := batcher.New(1, time.Hour,
-		batcher.WithCallback(batcher.CallbackFunc[int](func(context.Context, []int) error {
-			return nil
-		})),
-		prom.WithDefaultRegisterer[int](),
-	)
-
-	ctx := context.Background()
-	if err := b.Push(ctx, 1); err != nil {
-		t.Fatalf("Push: %v", err)
-	}
-	if err := b.Close(ctx); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	n, err := testutil.GatherAndCount(reg, "batcher_items_total")
-	if err != nil {
-		t.Fatalf("GatherAndCount: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("batcher_items_total series: got %d, want 1", n)
-	}
-	checkCounter(t, reg, "batcher_items_total", nil, 1)
 }
