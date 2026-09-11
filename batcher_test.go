@@ -271,6 +271,191 @@ func TestFanOutSequentialAndErrorDoesNotSkip(t *testing.T) {
 	})
 }
 
+func mustPushWait[T any](t *testing.T, b *Batcher[T], v T) *Ticket {
+	t.Helper()
+	ticket, err := b.PushWait(context.Background(), v)
+	if err != nil {
+		t.Fatalf("PushWait: %v", err)
+	}
+	return ticket
+}
+
+func TestTicketResolvesOnSizeFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		b := New(2, time.Hour, WithCallback[int](&r))
+		ticket1 := mustPushWait(t, b, 1)
+		ticket2 := mustPushWait(t, b, 2)
+		synctest.Wait()
+		if err := ticket1.Wait(context.Background()); err != nil {
+			t.Fatalf("ticket1.Wait: %v", err)
+		}
+		if err := ticket2.Wait(context.Background()); err != nil {
+			t.Fatalf("ticket2.Wait: %v", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestTicketBlocksUntilFlush(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		b := New(2, time.Hour, WithCallback[int](&r))
+		ticket := mustPushWait(t, b, 1)
+		waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := ticket.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Wait before flush: got %v, want DeadlineExceeded", err)
+		}
+		mustPush(t, b, 2)
+		synctest.Wait()
+		if err := ticket.Wait(context.Background()); err != nil {
+			t.Fatalf("ticket.Wait after flush: %v", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestTicketResolvesOnCloseDrain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		b := New(10, time.Hour, WithCallback[int](&r))
+		ticket := mustPushWait(t, b, 1)
+		mustClose(t, b)
+		if err := ticket.Wait(context.Background()); err != nil {
+			t.Fatalf("ticket.Wait after drain: %v", err)
+		}
+	})
+}
+
+func TestTicketResolvesWithWholeBatchError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		b := New(2, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(context.Context, []int) error {
+				return boom
+			})),
+			WithErrorHandler[int](func(context.Context, error) {}))
+		ticket1 := mustPushWait(t, b, 1)
+		ticket2 := mustPushWait(t, b, 2)
+		synctest.Wait()
+		if err := ticket1.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("ticket1.Wait: got %v, want boom", err)
+		}
+		if err := ticket2.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("ticket2.Wait: got %v, want boom", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestItemErrorsAttributePerItem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		b := New(3, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(_ context.Context, batch []int) error {
+				errs := make(ItemErrors, len(batch))
+				errs[1] = boom
+				return errs
+			})),
+			WithErrorHandler[int](func(context.Context, error) {}))
+		t0 := mustPushWait(t, b, 1)
+		t1 := mustPushWait(t, b, 2)
+		t2 := mustPushWait(t, b, 3)
+		synctest.Wait()
+		if err := t0.Wait(context.Background()); err != nil {
+			t.Fatalf("t0.Wait: got %v, want nil", err)
+		}
+		if err := t1.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("t1.Wait: got %v, want boom", err)
+		}
+		if err := t2.Wait(context.Background()); err != nil {
+			t.Fatalf("t2.Wait: got %v, want nil", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestItemErrorsMismatchedLengthActsAsWholeBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		boom := errors.New("boom")
+		b := New(2, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(_ context.Context, _ []int) error {
+				return ItemErrors{boom}
+			})),
+			WithErrorHandler[int](func(context.Context, error) {}))
+		t0 := mustPushWait(t, b, 1)
+		t1 := mustPushWait(t, b, 2)
+		synctest.Wait()
+		if err := t0.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("t0.Wait: got %v, want boom", err)
+		}
+		if err := t1.Wait(context.Background()); !errors.Is(err, boom) {
+			t.Fatalf("t1.Wait: got %v, want boom", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestItemErrorsJoinedAcrossCallbacks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		err1 := errors.New("first")
+		err2 := errors.New("second")
+		b := New(1, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(_ context.Context, _ []int) error {
+				return ItemErrors{err1}
+			})),
+			WithCallback[int](CallbackFunc[int](func(_ context.Context, _ []int) error {
+				return err2
+			})),
+			WithErrorHandler[int](func(context.Context, error) {}))
+		ticket := mustPushWait(t, b, 1)
+		synctest.Wait()
+		err := ticket.Wait(context.Background())
+		if !errors.Is(err, err1) || !errors.Is(err, err2) {
+			t.Fatalf("ticket.Wait: got %v, want both first and second", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestItemErrorsUnwrapAndError(t *testing.T) {
+	boom := errors.New("boom")
+	ie := ItemErrors{nil, boom, nil}
+	if !errors.Is(error(ie), boom) {
+		t.Fatal("errors.Is: ItemErrors does not unwrap to boom")
+	}
+	if got := ie.Error(); got != boom.Error() {
+		t.Fatalf("Error(): got %q, want %q", got, boom.Error())
+	}
+	if got := (ItemErrors{nil, nil}).Error(); got == "" {
+		t.Fatal("Error() on an all-nil ItemErrors: got empty string")
+	}
+}
+
+func TestTicketAbandonedOnCloseExpiry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := New(1, time.Hour,
+			WithBuffer[int](1),
+			WithCallback[int](CallbackFunc[int](func(cbCtx context.Context, _ []int) error {
+				<-cbCtx.Done()
+				return nil
+			})))
+		mustPush(t, b, 1)
+		synctest.Wait()
+		ticket := mustPushWait(t, b, 2)
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := b.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close with expired ctx: got %v, want DeadlineExceeded", err)
+		}
+		synctest.Wait()
+		if err := ticket.Wait(context.Background()); !errors.Is(err, ErrAbandoned) {
+			t.Fatalf("ticket.Wait after abandon: got %v, want ErrAbandoned", err)
+		}
+	})
+}
+
 func TestBufferBackpressure(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})

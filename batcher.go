@@ -17,8 +17,14 @@ import (
 // ErrClosed is returned by Push after Close has been called.
 var ErrClosed = errors.New("batcher: closed")
 
+// ErrAbandoned is returned by Ticket.Wait when the item's batch is dropped
+// undelivered because the context passed to Close expired first.
+var ErrAbandoned = errors.New("batcher: abandoned")
+
 // Callback consumes one batch. The batch slice is owned by the batcher and
-// must not be retained past the call.
+// must not be retained past the call. Returning an ItemErrors instead of a
+// plain error attributes failure to individual items rather than the whole
+// batch.
 type Callback[T any] interface {
 	Call(ctx context.Context, batch []T) error
 }
@@ -29,6 +35,64 @@ type CallbackFunc[T any] func(ctx context.Context, batch []T) error
 // Call calls f(ctx, batch).
 func (f CallbackFunc[T]) Call(ctx context.Context, batch []T) error {
 	return f(ctx, batch)
+}
+
+// ItemErrors is returned by Callback.Call in place of a single error to
+// attribute failure to individual items rather than the batch as a whole. It
+// must have the same length as the batch passed to Call; entry i is item i's
+// error, or nil if that item succeeded. An ItemErrors of any other length is
+// treated as an ordinary whole-batch error instead. A waiter's Ticket
+// resolves with the errors.Join of whatever every registered callback
+// attributed to its own item.
+type ItemErrors []error
+
+// Error joins the messages of the non-nil entries.
+func (e ItemErrors) Error() string {
+	if err := errors.Join([]error(e)...); err != nil {
+		return err.Error()
+	}
+	return "batcher: no item errors"
+}
+
+// Unwrap exposes the non-nil entries to errors.Is and errors.As.
+func (e ItemErrors) Unwrap() []error {
+	return e
+}
+
+// entry is one item in transit through the intake channel, paired with the
+// ticket to resolve once its batch flushes or is abandoned.
+type entry[T any] struct {
+	v T
+	t *Ticket
+}
+
+// Ticket is returned by PushWait and resolves once the item's batch has
+// flushed or been abandoned. The zero value is not usable; obtain a Ticket
+// from PushWait.
+type Ticket struct {
+	done chan struct{}
+	err  error
+}
+
+// resolve delivers err to the ticket and unblocks Wait. It must be called
+// exactly once, only by the loop goroutine that owns the batch.
+func (t *Ticket) resolve(err error) {
+	t.err = err
+	close(t.done)
+}
+
+// Wait blocks until the item's batch has flushed or been abandoned. It
+// returns nil once the batch has flushed with nothing attributed to this
+// item; the error attributed to it if some callback failed (see
+// ItemErrors); ErrAbandoned if the item was dropped without flushing; or
+// ctx.Err() if ctx expires first.
+func (t *Ticket) Wait(ctx context.Context) error {
+	select {
+	case <-t.done:
+		return t.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // FlushReason says why a batch flushed.
@@ -119,7 +183,7 @@ type Batcher[T any] struct {
 	observers []Observer
 	errh      func(context.Context, error)
 
-	ch     chan T
+	ch     chan entry[T]
 	done   chan struct{}
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -149,7 +213,7 @@ func New[T any](n int, d time.Duration, opts ...Option[T]) *Batcher[T] {
 			panic(err)
 		}
 	}
-	b.ch = make(chan T, b.buffer)
+	b.ch = make(chan entry[T], b.buffer)
 	b.done = make(chan struct{})
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	go b.loop()
@@ -158,27 +222,40 @@ func New[T any](n int, d time.Duration, opts ...Option[T]) *Batcher[T] {
 
 // Push submits one item. It blocks while the intake buffer is full, returns
 // ctx.Err() when ctx expires first, and returns ErrClosed once Close has been
-// called.
+// called. See PushWait to additionally wait for the item's batch to flush.
 func (b *Batcher[T]) Push(ctx context.Context, v T) error {
+	_, err := b.push(ctx, v, nil)
+	return err
+}
+
+// PushWait submits one item like Push, additionally returning a Ticket whose
+// Wait method resolves once the item's batch has flushed or been abandoned.
+func (b *Batcher[T]) PushWait(ctx context.Context, v T) (*Ticket, error) {
+	return b.push(ctx, v, &Ticket{done: make(chan struct{})})
+}
+
+// push is the shared implementation of Push and PushWait. t is nil for Push,
+// which forgoes the per-item ticket.
+func (b *Batcher[T]) push(ctx context.Context, v T, t *Ticket) (*Ticket, error) {
 	b.mu.RLock()
 	if b.closed {
 		b.mu.RUnlock()
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	b.wg.Add(1)
 	b.mu.RUnlock()
 	defer b.wg.Done()
 
 	select {
-	case b.ch <- v:
+	case b.ch <- entry[T]{v: v, t: t}:
 		for _, o := range b.observers {
 			o.ObservePush()
 		}
-		return nil
+		return t, nil
 	case <-b.ctx.Done():
-		return ErrClosed
+		return nil, ErrClosed
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 
@@ -213,9 +290,10 @@ func (b *Batcher[T]) loop() {
 	defer close(b.done)
 
 	var (
-		buf    []T
-		timer  *time.Timer
-		timerC <-chan time.Time
+		buf     []T
+		tickets []*Ticket
+		timer   *time.Timer
+		timerC  <-chan time.Time
 	)
 
 	flush := func(reason FlushReason) {
@@ -230,12 +308,27 @@ func (b *Batcher[T]) loop() {
 		if len(b.observers) != 0 {
 			start = time.Now()
 		}
+		needItemErrs := false
+		for _, t := range tickets {
+			if t != nil {
+				needItemErrs = true
+				break
+			}
+		}
+		var itemErrs []error
+		if needItemErrs {
+			itemErrs = make([]error, len(buf))
+		}
 		for _, cb := range b.callbacks {
-			if err := cb.Call(b.ctx, buf); err != nil {
+			err := cb.Call(b.ctx, buf)
+			if err != nil {
 				for _, o := range b.observers {
 					o.ObserveError(err)
 				}
 				b.errh(b.ctx, err)
+			}
+			if needItemErrs {
+				attributeItemError(itemErrs, err)
 			}
 		}
 		if len(b.observers) != 0 {
@@ -244,26 +337,33 @@ func (b *Batcher[T]) loop() {
 				o.ObserveFlush(reason, len(buf), d)
 			}
 		}
+		for i, t := range tickets {
+			if t != nil {
+				t.resolve(itemErrs[i])
+			}
+		}
 		buf = buf[:0]
+		tickets = tickets[:0]
 	}
 
 	for {
 		select {
 		case <-b.ctx.Done():
-			b.abandon(len(buf))
+			b.abandon(tickets)
 			return
 		default:
 		}
 		select {
 		case <-b.ctx.Done():
-			b.abandon(len(buf))
+			b.abandon(tickets)
 			return
-		case v, ok := <-b.ch:
+		case e, ok := <-b.ch:
 			if !ok {
 				flush(FlushReasonDrain)
 				return
 			}
-			buf = append(buf, v)
+			buf = append(buf, e.v)
+			tickets = append(tickets, e.t)
 			switch {
 			case len(buf) >= b.n:
 				flush(FlushReasonSize)
@@ -282,19 +382,55 @@ func (b *Batcher[T]) loop() {
 	}
 }
 
-// abandon reports to the observers the accepted items the loop leaves
-// undelivered on context expiry: the pending batch plus everything still in
-// the intake channel, which it drains to count. It blocks until Push can no
-// longer accept, so the count is final.
-func (b *Batcher[T]) abandon(pending int) {
-	if len(b.observers) == 0 {
+// attributeItemError folds one callback's returned error into dst, one slot
+// per batch item. An ItemErrors of the same length as dst attributes each
+// entry to its item; any other error is attributed to every item.
+func attributeItemError(dst []error, err error) {
+	if err == nil {
 		return
 	}
-	n := pending
-	for range b.ch {
-		n++
+	var ie ItemErrors
+	if errors.As(err, &ie) && len(ie) == len(dst) {
+		for i, e := range ie {
+			if e == nil {
+				continue
+			}
+			if dst[i] == nil {
+				dst[i] = e
+			} else {
+				dst[i] = errors.Join(dst[i], e)
+			}
+		}
+		return
 	}
-	if n == 0 {
+	for i := range dst {
+		if dst[i] == nil {
+			dst[i] = err
+		} else {
+			dst[i] = errors.Join(dst[i], err)
+		}
+	}
+}
+
+// abandon resolves with ErrAbandoned the tickets of items the loop leaves
+// undelivered on context expiry, and reports their count to the observers:
+// the pending batch's tickets plus everything still in the intake channel,
+// which it drains to collect them. It blocks until Push can no longer
+// accept, so the count is final.
+func (b *Batcher[T]) abandon(pending []*Ticket) {
+	n := len(pending)
+	for _, t := range pending {
+		if t != nil {
+			t.resolve(ErrAbandoned)
+		}
+	}
+	for e := range b.ch {
+		n++
+		if e.t != nil {
+			e.t.resolve(ErrAbandoned)
+		}
+	}
+	if len(b.observers) == 0 || n == 0 {
 		return
 	}
 	for _, o := range b.observers {

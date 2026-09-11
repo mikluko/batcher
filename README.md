@@ -42,6 +42,8 @@ if err := b.Close(ctx); err != nil {
 - **Batching guarantee.** A batch flushes when it reaches the size limit or when its oldest item has waited out the interval, whichever comes first. Nothing runs while the batcher is idle. Every batch fans out to all registered callbacks sequentially, in registration order; the batch slice is owned by the batcher and must not be retained past the call.
 - **Error policy.** Loud by default: a non-nil callback error panics unless `WithErrorHandler` installs a handler. An error from one callback does not skip the remaining callbacks for that batch.
 - **Shutdown.** `Close` stops intake (`Push` returns `ErrClosed`) and drains everything already accepted through the callbacks as final batches. Only expiry of the context passed to `Close` abandons the remainder, returning its error; shutdown loss is always the caller's explicit deadline. `Close` is idempotent.
+- **Waiting for a flush.** `PushWait` returns a `Ticket` alongside the usual error; `Ticket.Wait` blocks until the item's batch has flushed (`nil` if nothing was attributed to that item, or the error attributed to it otherwise), is abandoned at shutdown (`ErrAbandoned`), or the `Wait` call's own context expires (`ctx.Err()`).
+- **Per-item errors.** A callback returns `ItemErrors` instead of a plain error to attribute failure to specific items rather than the whole batch; entries left `nil` succeeded. A plain error still works and is attributed to every item, so waiters can tell which of their own pushes need a retry.
 
 Full documentation and runnable examples: [pkg.go.dev/github.com/mikluko/batcher](https://pkg.go.dev/github.com/mikluko/batcher).
 
