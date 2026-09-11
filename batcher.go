@@ -24,7 +24,9 @@ var ErrAbandoned = errors.New("batcher: abandoned")
 // Callback consumes one batch. The batch slice is owned by the batcher and
 // must not be retained past the call. Returning an ItemErrors instead of a
 // plain error attributes failure to individual items rather than the whole
-// batch.
+// batch. Call is never invoked concurrently with itself unless
+// WithFlushConcurrency sets M>1, in which case it may run concurrently for
+// different batches.
 type Callback[T any] interface {
 	Call(ctx context.Context, batch []T) error
 }
@@ -113,7 +115,8 @@ const (
 // callback error, and ObserveDrop with the number of accepted items
 // abandoned when the context given to Close expires. ObservePush may be
 // called concurrently with the other methods; implementations must be safe
-// for concurrent use.
+// for concurrent use. Once WithFlushConcurrency sets M>1, every method may
+// additionally be called concurrently with itself, for different batches.
 type Observer interface {
 	// ObservePush is called once per accepted Push.
 	ObservePush()
@@ -164,10 +167,28 @@ func WithObserver[T any](o Observer) Option[T] {
 
 // WithErrorHandler sets the handler invoked with each non-nil callback error.
 // Without it the batcher is loud by default: the default handler panics on the
-// first error. Tolerating callback errors is opt-in through this option.
+// first error. Tolerating callback errors is opt-in through this option. Once
+// WithFlushConcurrency sets M>1, h may be called concurrently for different
+// batches and must be safe for that.
 func WithErrorHandler[T any](h func(context.Context, error)) Option[T] {
 	return func(b *Batcher[T]) {
 		b.errh = h
+	}
+}
+
+// WithFlushConcurrency sets how many batches may be filling or flushing at
+// once, M. The default is 1: batches never overlap. A higher M instead
+// builds M independent sequential batchers and routes intake to one of them
+// until it starts flushing (by reaching its size limit or timing out), then
+// moves to the next one that isn't already flushing; Push and PushWait
+// block once every one is, until one finishes. This trades two guarantees
+// for throughput under a slow callback: Callback.Call and the
+// WithErrorHandler handler may now run concurrently across different
+// batches and must be safe for that, and batches are no longer guaranteed
+// to complete in arrival order. New panics if m is less than 1.
+func WithFlushConcurrency[T any](m int) Option[T] {
+	return func(b *Batcher[T]) {
+		b.flushConcurrency = m
 	}
 }
 
@@ -176,12 +197,24 @@ func WithErrorHandler[T any](h func(context.Context, error)) Option[T] {
 // has waited d; nothing runs while the batcher is idle. Batcher is safe for
 // concurrent use.
 type Batcher[T any] struct {
-	n         int
-	d         time.Duration
-	buffer    int
-	callbacks []Callback[T]
-	observers []Observer
-	errh      func(context.Context, error)
+	n                int
+	d                time.Duration
+	buffer           int
+	callbacks        []Callback[T]
+	observers        []Observer
+	errh             func(context.Context, error)
+	flushConcurrency int
+
+	children []*Batcher[T]
+
+	// routerMu, cur, busy, and wake implement pick's routing on the
+	// top-level wrapper only, when children is non-empty. flushHook is set
+	// on each child by the wrapper that built it, and is otherwise nil.
+	routerMu  sync.Mutex
+	cur       int
+	busy      []bool
+	wake      chan struct{}
+	flushHook func(active bool)
 
 	ch     chan entry[T]
 	done   chan struct{}
@@ -199,31 +232,82 @@ type Batcher[T any] struct {
 // New returns a running Batcher that flushes a batch when it reaches n items
 // or when its oldest item has waited d. The delivery loop runs in a goroutine
 // New starts; stop it with Close. At least one WithCallback option is
-// required; New panics otherwise.
+// required; New panics otherwise, and so does a WithFlushConcurrency below 1.
+//
+// With WithFlushConcurrency left at its default of 1, New returns a single
+// sequential instance. A higher M instead builds M such instances sharing
+// the same callbacks, observers, and error handler, and returns a Batcher
+// that routes Push and PushWait across them; see WithFlushConcurrency.
 func New[T any](n int, d time.Duration, opts ...Option[T]) *Batcher[T] {
-	b := &Batcher[T]{n: n, d: d}
+	b := &Batcher[T]{n: n, d: d, flushConcurrency: 1}
 	for _, opt := range opts {
 		opt(b)
 	}
 	if len(b.callbacks) == 0 {
 		panic("batcher: no callback registered")
 	}
+	if b.flushConcurrency < 1 {
+		panic("batcher: flush concurrency must be at least 1")
+	}
 	if b.errh == nil {
 		b.errh = func(_ context.Context, err error) {
 			panic(err)
 		}
 	}
+	if b.flushConcurrency == 1 {
+		b.start()
+		return b
+	}
+	w := &Batcher[T]{
+		children: make([]*Batcher[T], b.flushConcurrency),
+		busy:     make([]bool, b.flushConcurrency),
+		wake:     make(chan struct{}),
+	}
+	for i := range w.children {
+		c := &Batcher[T]{
+			n: n, d: d,
+			buffer:    b.buffer,
+			callbacks: b.callbacks,
+			observers: b.observers,
+			errh:      b.errh,
+		}
+		c.flushHook = func(active bool) {
+			w.routerMu.Lock()
+			w.busy[i] = active
+			if !active {
+				close(w.wake)
+				w.wake = make(chan struct{})
+			}
+			w.routerMu.Unlock()
+		}
+		c.start()
+		w.children[i] = c
+	}
+	return w
+}
+
+// start allocates the intake channel and launches the delivery loop. b must
+// already carry its resolved configuration.
+func (b *Batcher[T]) start() {
 	b.ch = make(chan entry[T], b.buffer)
 	b.done = make(chan struct{})
 	b.ctx, b.cancel = context.WithCancel(context.Background())
 	go b.loop()
-	return b
 }
 
 // Push submits one item. It blocks while the intake buffer is full, returns
 // ctx.Err() when ctx expires first, and returns ErrClosed once Close has been
 // called. See PushWait to additionally wait for the item's batch to flush.
+// With WithFlushConcurrency set above 1, Push routes to one of the
+// underlying batchers; see WithFlushConcurrency.
 func (b *Batcher[T]) Push(ctx context.Context, v T) error {
+	if len(b.children) != 0 {
+		c, err := b.pick(ctx)
+		if err != nil {
+			return err
+		}
+		return c.Push(ctx, v)
+	}
 	_, err := b.push(ctx, v, nil)
 	return err
 }
@@ -231,7 +315,41 @@ func (b *Batcher[T]) Push(ctx context.Context, v T) error {
 // PushWait submits one item like Push, additionally returning a Ticket whose
 // Wait method resolves once the item's batch has flushed or been abandoned.
 func (b *Batcher[T]) PushWait(ctx context.Context, v T) (*Ticket, error) {
+	if len(b.children) != 0 {
+		c, err := b.pick(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return c.PushWait(ctx, v)
+	}
 	return b.push(ctx, v, &Ticket{done: make(chan struct{})})
+}
+
+// pick returns the last underlying batcher used, if it is not currently
+// flushing, or else the next one after it, in rotation, that isn't. It
+// blocks until one is available or ctx expires.
+func (b *Batcher[T]) pick(ctx context.Context) (*Batcher[T], error) {
+	b.routerMu.Lock()
+	for {
+		n := len(b.children)
+		for i := range n {
+			idx := (b.cur + i) % n
+			if !b.busy[idx] {
+				b.cur = idx
+				c := b.children[idx]
+				b.routerMu.Unlock()
+				return c, nil
+			}
+		}
+		wake := b.wake
+		b.routerMu.Unlock()
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		b.routerMu.Lock()
+	}
 }
 
 // push is the shared implementation of Push and PushWait. t is nil for Push,
@@ -262,8 +380,24 @@ func (b *Batcher[T]) push(ctx context.Context, v T, t *Ticket) (*Ticket, error) 
 // Close stops intake and drains everything already accepted through the
 // callbacks as final batches. Expiry of ctx abandons the remainder and
 // returns ctx.Err(); shutdown loss is always the caller's explicit deadline.
-// Close is idempotent: a second call returns the first result.
+// Close is idempotent: a second call returns the first result. With
+// WithFlushConcurrency set above 1, Close closes every underlying batcher
+// concurrently against the same ctx and returns their errors joined
+// (errors.Join), nil if every one closed cleanly.
 func (b *Batcher[T]) Close(ctx context.Context) error {
+	if len(b.children) != 0 {
+		errs := make([]error, len(b.children))
+		var wg sync.WaitGroup
+		wg.Add(len(b.children))
+		for i, c := range b.children {
+			go func() {
+				defer wg.Done()
+				errs[i] = c.Close(ctx)
+			}()
+		}
+		wg.Wait()
+		return errors.Join(errs...)
+	}
 	b.closeOnce.Do(func() {
 		b.mu.Lock()
 		b.closed = true
@@ -290,10 +424,11 @@ func (b *Batcher[T]) loop() {
 	defer close(b.done)
 
 	var (
-		buf     []T
-		tickets []*Ticket
-		timer   *time.Timer
-		timerC  <-chan time.Time
+		buf      []T
+		tickets  []*Ticket
+		itemErrs []error
+		timer    *time.Timer
+		timerC   <-chan time.Time
 	)
 
 	flush := func(reason FlushReason) {
@@ -303,6 +438,10 @@ func (b *Batcher[T]) loop() {
 		}
 		if len(buf) == 0 {
 			return
+		}
+		if b.flushHook != nil {
+			b.flushHook(true)
+			defer b.flushHook(false)
 		}
 		var start time.Time
 		if len(b.observers) != 0 {
@@ -315,9 +454,13 @@ func (b *Batcher[T]) loop() {
 				break
 			}
 		}
-		var itemErrs []error
 		if needItemErrs {
-			itemErrs = make([]error, len(buf))
+			if cap(itemErrs) < len(buf) {
+				itemErrs = make([]error, len(buf))
+			} else {
+				itemErrs = itemErrs[:len(buf)]
+				clear(itemErrs)
+			}
 		}
 		for _, cb := range b.callbacks {
 			err := cb.Call(b.ctx, buf)

@@ -3,6 +3,7 @@ package batcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -40,6 +41,27 @@ func assertBatches(t *testing.T, got, want [][]int) {
 	for i := range want {
 		if !slices.Equal(got[i], want[i]) {
 			t.Fatalf("batch %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// assertBatchesUnordered compares batches ignoring their relative order,
+// since WithFlushConcurrency does not guarantee batches complete in arrival
+// order.
+func assertBatchesUnordered(t *testing.T, got, want [][]int) {
+	t.Helper()
+	sorted := func(bs [][]int) [][]int {
+		bs = slices.Clone(bs)
+		slices.SortFunc(bs, slices.Compare)
+		return bs
+	}
+	g, w := sorted(got), sorted(want)
+	if len(g) != len(w) {
+		t.Fatalf("got %d batches %v, want %v", len(g), g, w)
+	}
+	for i := range w {
+		if !slices.Equal(g[i], w[i]) {
+			t.Fatalf("batches (order-insensitive): got %v, want %v", g, w)
 		}
 	}
 }
@@ -507,6 +529,98 @@ func TestNewPanicsWithoutCallback(t *testing.T) {
 	New[int](1, time.Second)
 }
 
+func TestNewPanicsOnInvalidFlushConcurrency(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("New with flush concurrency 0 did not panic")
+		}
+	}()
+	New(1, time.Second,
+		WithCallback[int](CallbackFunc[int](func(context.Context, []int) error { return nil })),
+		WithFlushConcurrency[int](0))
+}
+
+func TestFlushConcurrencyFillsOneChildBeforeMovingToNext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var got [][]int
+		release := make(chan struct{})
+		cb := CallbackFunc[int](func(_ context.Context, batch []int) error {
+			mu.Lock()
+			got = append(got, slices.Clone(batch))
+			mu.Unlock()
+			<-release
+			return nil
+		})
+		b := New(2, time.Hour, WithCallback[int](cb), WithFlushConcurrency[int](2))
+		mustPush(t, b, 1) // child 0
+		mustPush(t, b, 2) // child 0, fills it (n=2) -> flush starts, blocks in cb
+		synctest.Wait()   // child 0 is now durably blocked in cb
+		mustPush(t, b, 3) // child 0 busy -> routed to child 1
+		mustPush(t, b, 4) // child 1, fills it (n=2) -> flush starts, blocks in cb
+		synctest.Wait()   // child 1 is now durably blocked in cb too
+		close(release)
+		mustClose(t, b)
+		assertBatchesUnordered(t, got, [][]int{{1, 2}, {3, 4}})
+	})
+}
+
+func TestFlushConcurrencyRunsChildrenInParallel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		var inFlight atomic.Int32
+		cb := CallbackFunc[int](func(context.Context, []int) error {
+			inFlight.Add(1)
+			<-release
+			return nil
+		})
+		b := New(1, time.Hour, WithCallback[int](cb), WithFlushConcurrency[int](2))
+		mustPush(t, b, 1)
+		synctest.Wait() // child 0 is durably blocked in cb before item 2 is routed
+		mustPush(t, b, 2)
+		synctest.Wait()
+		if got := inFlight.Load(); got != 2 {
+			t.Fatalf("concurrent flushes: got %d, want 2", got)
+		}
+		close(release)
+		mustClose(t, b)
+	})
+}
+
+func TestFlushConcurrencyPushWaitResolves(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var r recorder
+		b := New(1, time.Hour, WithCallback[int](&r), WithFlushConcurrency[int](2))
+		ticket := mustPushWait(t, b, 1)
+		synctest.Wait()
+		if err := ticket.Wait(context.Background()); err != nil {
+			t.Fatalf("ticket.Wait: %v", err)
+		}
+		mustClose(t, b)
+	})
+}
+
+func TestFlushConcurrencyCloseJoinsChildErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := New(1, time.Hour,
+			WithCallback[int](CallbackFunc[int](func(cbCtx context.Context, _ []int) error {
+				<-cbCtx.Done()
+				return nil
+			})),
+			WithFlushConcurrency[int](2))
+		mustPush(t, b, 1) // child 0, triggers flush (n=1), blocks in callback
+		synctest.Wait()   // child 0 is durably blocked before item 2 is routed
+		mustPush(t, b, 2) // child 0 busy -> child 1, triggers flush (n=1), blocks
+		synctest.Wait()
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		err := b.Close(closeCtx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close: got %v, want DeadlineExceeded", err)
+		}
+	})
+}
+
 func TestCallbackFunc(t *testing.T) {
 	boom := errors.New("boom")
 	var got []int
@@ -809,4 +923,97 @@ func BenchmarkBatcher(b *testing.B) {
 			_ = d.Push(ctx, struct{}{})
 		}
 	})
+}
+
+// BenchmarkBatcherPushWait mirrors BenchmarkBatcher but takes the Ticket
+// returned by PushWait, so every flush allocates the itemErrs slice that
+// backs ticket resolution even though nothing ever fails.
+func BenchmarkBatcherPushWait(b *testing.B) {
+	ctx := context.Background()
+
+	d := New(10, 100*time.Millisecond, WithCallback(CallbackFunc[struct{}](
+		func(context.Context, []struct{}) error { return nil },
+	)))
+	defer func() { _ = d.Close(ctx) }()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = d.PushWait(ctx, struct{}{})
+		}
+	})
+}
+
+var errBenchItem = errors.New("bench: item failed")
+
+// BenchmarkBatcherPushWaitItemErrors mirrors BenchmarkBatcherPushWait but the
+// callback attributes failure to half of every batch, exercising the
+// attributeItemError join path in addition to the itemErrs allocation.
+func BenchmarkBatcherPushWaitItemErrors(b *testing.B) {
+	ctx := context.Background()
+
+	d := New(10, 100*time.Millisecond,
+		WithCallback(CallbackFunc[struct{}](func(_ context.Context, batch []struct{}) error {
+			errs := make(ItemErrors, len(batch))
+			for i := range errs {
+				if i%2 == 0 {
+					errs[i] = errBenchItem
+				}
+			}
+			return errs
+		})),
+		WithErrorHandler[struct{}](func(context.Context, error) {}))
+	defer func() { _ = d.Close(ctx) }()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, _ = d.PushWait(ctx, struct{}{})
+		}
+	})
+}
+
+// BenchmarkBatcherFlushConcurrencyOverhead mirrors BenchmarkBatcher but with
+// WithFlushConcurrency(2) and an instant callback, isolating the router's own
+// per-push cost (routerMu plus the wake channel's close-and-replace on every
+// flush) from any actual concurrency benefit.
+func BenchmarkBatcherFlushConcurrencyOverhead(b *testing.B) {
+	ctx := context.Background()
+
+	d := New(10, 100*time.Millisecond,
+		WithCallback(CallbackFunc[struct{}](
+			func(context.Context, []struct{}) error { return nil },
+		)),
+		WithFlushConcurrency[struct{}](2))
+	defer func() { _ = d.Close(ctx) }()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = d.Push(ctx, struct{}{})
+		}
+	})
+}
+
+// BenchmarkBatcherFlushConcurrencySlowCallback measures throughput at
+// increasing WithFlushConcurrency against a callback slow enough (50µs) to
+// model blocking I/O, showing whether concurrent flushing actually buys
+// throughput under that load.
+func BenchmarkBatcherFlushConcurrencySlowCallback(b *testing.B) {
+	ctx := context.Background()
+
+	for _, m := range []int{1, 2, 4, 8} {
+		b.Run(fmt.Sprintf("M=%d", m), func(b *testing.B) {
+			d := New(10, 100*time.Millisecond,
+				WithCallback(CallbackFunc[struct{}](func(context.Context, []struct{}) error {
+					time.Sleep(50 * time.Microsecond)
+					return nil
+				})),
+				WithFlushConcurrency[struct{}](m))
+			defer func() { _ = d.Close(ctx) }()
+
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_ = d.Push(ctx, struct{}{})
+				}
+			})
+		})
+	}
 }
