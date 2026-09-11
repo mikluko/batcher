@@ -1,6 +1,6 @@
 # batcher
 
-[![CI](https://github.com/mikluko/batcher/actions/workflows/ci.yml/badge.svg)](https://github.com/mikluko/batcher/actions/workflows/ci.yml)
+[![CI](https://github.com/mikluko/batcher/actions/workflows/release.yaml/badge.svg)](https://github.com/mikluko/batcher/actions/workflows/release.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/mikluko/batcher.svg)](https://pkg.go.dev/github.com/mikluko/batcher)
 
 Generic batching for Go: accumulate pushed items and deliver them to callbacks when a batch fills up or its oldest item has waited long enough.
@@ -69,6 +69,10 @@ Wiring an `Observer` to a metrics backend is the caller's, since the backend is 
 | `batcher_flush_duration_seconds` | histogram | Duration of the callback fan-out per batch |
 | `batcher_callback_errors_total` | counter | Non-nil callback errors |
 | `batcher_items_dropped_total` | counter | Accepted items abandoned when the `Close` context expired |
+
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) lists every release; the `Unreleased` section names what has landed on `main` since. A push there that names a new version cuts its tag automatically ([`mikluko/action-changelog`](https://github.com/mikluko/action-changelog)).
 
 ## License
 

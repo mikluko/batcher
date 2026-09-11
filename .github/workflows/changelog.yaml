@@ -1,0 +1,18 @@
+name: Changelog
+
+on:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The reference tag is the newest one reachable from HEAD, so the
+          # full history and tags need to be here.
+          fetch-depth: 0
+
+      - uses: mikluko/action-changelog@v1
+        with:
+          changelog: CHANGELOG.md
